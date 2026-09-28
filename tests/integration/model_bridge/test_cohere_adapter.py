@@ -1,16 +1,18 @@
 """Integration tests for Cohere architecture adapter (CohereForCausalLM).
 
 Model: trl-internal-testing/tiny-CohereForCausalLM
-  - 2 layers, ~8M params, CPU-safe, no gating required
+  - 2 layers, CPU-safe, no gating required
   - tie_word_embeddings=True by default
   - logit_scale=0.125 (canonical Command-R is 0.0625; tiny diverges so
     regression tests catch silent-fallback bugs in the passthrough)
 
 NOTE: The tiny model has use_qk_norm=False, so QK-norm is not exercised here.
-Cohere's QK-norm is a per-head LayerNorm inside CohereAttention.forward; it is
-handled via HF delegation (PositionEmbeddingsAttentionBridge calls the original
-CohereAttention.forward directly), so functional correctness for that path relies
-on the same delegation mechanism verified in test_forward_matches_hf.
+These tests cover the unprocessed tiny-model path, not production checkpoints or
+full compatibility-mode processing. Longer-input parity may expose adapter bugs;
+do not weaken the assertions to make an implementation mismatch pass.
+
+Run from the fork's configured environment:
+    uv run pytest tests/integration/model_bridge/test_cohere_adapter.py -v
 """
 
 from typing import Any
@@ -26,12 +28,69 @@ from transformer_lens.model_bridge.generalized_components.position_embeddings_at
 )
 
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
+pytestmark = pytest.mark.slow
+LOGIT_ATOL = 1e-4
+ACTIVATION_ATOL = 1e-5
+LONG_SEQUENCE_LENGTH = 128
+LONG_PROMPT = (
+    "At dawn, the research team checked the instruments beside the harbor. "
+    "Mira recorded seven measurements, then compared them with yesterday's log. "
+    "The first sensor stayed steady, but the second changed after the door opened. "
+    "Why did the readings disagree? They repeated the experiment with the door closed, "
+    "swapped the sensors, and wrote down the sequence before drawing a conclusion. "
+    "Later, a colleague reviewed the notes and asked whether temperature, timing, "
+    "or calibration could explain the difference. Every observation remained in the report. "
+) * 4
+
+
+def _load_cohere_bridge() -> TransformerBridge:
+    """Match the independent HF reference's precision and evaluation mode."""
+    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu", dtype=torch.float32)
+    bridge.eval()
+    bridge.original_model.eval()
+    assert bridge.original_model.config._attn_implementation == "eager"
+    return bridge
+
+
+@pytest.fixture(scope="module", params=["short", "long"])
+def cohere_tokens(request: pytest.FixtureRequest, cohere_bridge: TransformerBridge) -> torch.Tensor:
+    """Use identical IDs on both sides; retain the old case plus 128 text tokens."""
+    if request.param == "short":
+        return torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    tokens = cohere_bridge.tokenizer(
+        LONG_PROMPT, return_tensors="pt", add_special_tokens=True, truncation=False
+    )["input_ids"]
+    assert tokens.shape[1] >= LONG_SEQUENCE_LENGTH, "Long prompt unexpectedly tokenized too short"
+    max_positions = cohere_bridge.original_model.config.max_position_embeddings
+    assert max_positions >= LONG_SEQUENCE_LENGTH, "Checkpoint context is too short for this test"
+    return tokens[:, :LONG_SEQUENCE_LENGTH].contiguous()
+
+
+def _assert_max_abs_close(actual: torch.Tensor, expected: torch.Tensor, atol: float, label: str) -> None:
+    """Enforce absolute error without a relative-tolerance escape hatch."""
+    assert actual.shape == expected.shape, f"{label}: shape {actual.shape} != {expected.shape}"
+    assert actual.dtype == expected.dtype == torch.float32, f"{label}: expected float32"
+    assert torch.isfinite(actual).all().item(), f"{label}: bridge contains non-finite values"
+    assert torch.isfinite(expected).all().item(), f"{label}: HF contains non-finite values"
+    max_diff = (actual - expected).abs().max().item()
+    assert max_diff < atol, f"{label}: max absolute difference {max_diff:.8g} >= {atol}"
+
+
+def _capture_activation(name: str, activations: dict[str, torch.Tensor]) -> Any:
+    """Copy HF outputs so later operations cannot mutate the reference."""
+
+    def capture(_module: torch.nn.Module, _inputs: Any, output: torch.Tensor) -> None:
+        assert isinstance(output, torch.Tensor), f"{name}: expected a tensor output"
+        assert name not in activations, f"{name}: unexpectedly ran more than once"
+        activations[name] = output.detach().clone()
+
+    return capture
 
 
 @pytest.fixture(scope="module")
 def cohere_bridge():
     """Load tiny Cohere bridge once per module (no weight processing)."""
-    return TransformerBridge.boot_transformers(MODEL, device="cpu")
+    return _load_cohere_bridge()
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +101,7 @@ def cohere_bridge_processed():
     it automatically. We disable all ProcessWeights options so only the adapter's
     preprocess_weights (logit_scale fold + untie) runs.
     """
-    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
+    bridge = _load_cohere_bridge()
     bridge.process_weights(
         fold_ln=False,
         center_writing_weights=False,
@@ -56,7 +115,9 @@ def cohere_bridge_processed():
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
     """Load the raw HF model for side-by-side comparisons."""
-    return AutoModelForCausalLM.from_pretrained(MODEL).eval()
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float32, attn_implementation="eager"
+    ).to("cpu").eval()
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +213,39 @@ class TestCohereForwardEquivalence:
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
 
-    def test_forward_matches_hf(self, cohere_bridge: TransformerBridge, cohere_hf: Any) -> None:
-        """Bridge delegates to HF native forward — logits should be identical."""
-        tokens = torch.tensor([[1, 2, 3, 4]])
-        with torch.no_grad():
-            bridge_out = cohere_bridge(tokens)
-            hf_out = cohere_hf(tokens).logits
-        max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff:.6f}"
+    def test_forward_matches_hf(
+        self, cohere_bridge: TransformerBridge, cohere_hf: Any, cohere_tokens: torch.Tensor
+    ) -> None:
+        """Compare logits and every block's norm output during real forward passes."""
+        reference: dict[str, torch.Tensor] = {}
+        norm_modules = {
+            f"blocks.{i}.ln1.hook_out": layer.input_layernorm
+            for i, layer in enumerate(cohere_hf.model.layers)
+        }
+        norm_modules["ln_final.hook_out"] = cohere_hf.model.norm
+        handles = []
+        try:
+            for name, module in norm_modules.items():
+                handles.append(module.register_forward_hook(_capture_activation(name, reference)))
+            with torch.no_grad():
+                hf_logits = cohere_hf(cohere_tokens, use_cache=False).logits
+                bridge_logits, cache = cohere_bridge.run_with_cache(
+                    cohere_tokens, names_filter=list(norm_modules), use_cache=False
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert set(reference) == set(norm_modules), "HF did not execute every expected norm"
+        for name in norm_modules:
+            assert name in cache, f"Bridge did not cache {name}"
+            _assert_max_abs_close(
+                cache[name],
+                reference[name],
+                ACTIVATION_ATOL,
+                f"{name} ({cohere_tokens.shape[1]} tokens)",
+            )
+        _assert_max_abs_close(bridge_logits, hf_logits, LOGIT_ATOL, "forward logits")
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +277,7 @@ class TestCohereLogitScaleEndToEnd:
             f"logit_scale={logit_scale}"
         )
 
-    def test_logit_scale_folded_not_applied_twice(
+    def test_unprocessed_logit_scale_not_applied_twice(
         self, cohere_bridge: TransformerBridge, cohere_hf: Any
     ) -> None:
         """Confirm logit_scale isn't double-applied.
@@ -204,7 +290,7 @@ class TestCohereLogitScaleEndToEnd:
         with torch.no_grad():
             bridge_out = cohere_bridge(tokens)
             hf_out = cohere_hf(tokens).logits
-        # If logit_scale were applied twice, outputs would differ by a factor of 16
+        # A second scale multiply changes outputs by the checkpoint-specific logit_scale.
         max_diff = (bridge_out - hf_out).abs().max().item()
         assert max_diff < 1e-4, f"Possible double-application of logit_scale; diff={max_diff:.6f}"
 
@@ -241,8 +327,8 @@ class TestCohereTiedEmbedding:
         #
         # cfg.logit_scale is set before process_weights so the fold (which reads it
         # inside preprocess_weights) runs with the parametrized value.
-        bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
-        bridge.cfg.logit_scale = logit_scale  # type: ignore[attr-defined]
+        bridge = _load_cohere_bridge()
+        setattr(bridge.cfg, "logit_scale", logit_scale)
         bridge.process_weights(
             fold_ln=False,
             center_writing_weights=False,
@@ -266,12 +352,12 @@ class TestCohereTiedEmbedding:
 
 
 # ---------------------------------------------------------------------------
-# 5. HF delegation — RoPE, attention, normalization go through HF modules
+# 5. HF component wiring
 # ---------------------------------------------------------------------------
 
 
-class TestCohereHFDelegation:
-    """Spot-check that bridge submodules delegate to actual HF modules.
+class TestCohereHFComponentWiring:
+    """Spot-check that bridge submodules retain the expected HF objects.
 
     This confirms setup_component_testing wired rotary_emb correctly and that
     NormalizationBridge and PositionEmbeddingsAttentionBridge hold live HF objects.
@@ -332,3 +418,4 @@ class TestCohereParallelHooks:
         for i in range(2):
             assert f"blocks.{i}.hook_resid_pre" in cache
             assert f"blocks.{i}.hook_resid_post" in cache
+
