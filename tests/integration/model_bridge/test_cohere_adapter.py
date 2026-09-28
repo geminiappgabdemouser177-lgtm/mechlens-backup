@@ -3,8 +3,8 @@
 Model: trl-internal-testing/tiny-CohereForCausalLM
   - 2 layers, CPU-safe, no gating required
   - tie_word_embeddings=True by default
-  - logit_scale=0.125 (canonical Command-R is 0.0625; tiny diverges so
-    regression tests catch silent-fallback bugs in the passthrough)
+  - logit_scale=0.125 (adapter fallback is 0.0625 when absent or None;
+    the explicit assertion catches silent fallback for this fixture)
 
 NOTE: The tiny model has use_qk_norm=False, so QK-norm is not exercised here.
 These tests cover the unprocessed tiny-model path, not production checkpoints or
@@ -249,12 +249,12 @@ class TestCohereForwardEquivalence:
 
 
 # ---------------------------------------------------------------------------
-# 3. Logit scale applied end-to-end
+# 3. Processed weight scaling and unprocessed forward parity
 # ---------------------------------------------------------------------------
 
 
-class TestCohereLogitScaleEndToEnd:
-    """Verify logit_scale is correctly folded into the loaded model.
+class TestCohereLogitScaleChecks:
+    """Check processed weights and unprocessed logits, not processed forward parity.
 
     process_weights must be called before the fold takes effect — boot_transformers
     alone does NOT call process_weights. cohere_bridge_processed uses a fixture that
@@ -418,4 +418,3 @@ class TestCohereParallelHooks:
         for i in range(2):
             assert f"blocks.{i}.hook_resid_pre" in cache
             assert f"blocks.{i}.hook_resid_post" in cache
-
